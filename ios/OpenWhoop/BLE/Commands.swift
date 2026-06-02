@@ -40,6 +40,11 @@ public enum WhoopCommand: UInt8, CaseIterable {
     /// biometric retention + disconnected operation). Safe/reversible (just a data stream). Verified
     /// on-device: 2.1/s → 0/s, and it persists across reconnect.
     case sendR10R11Realtime    = 63
+    /// RECOVERY ONLY: reboot the strap to LATCH a freshly-set clock. A strap whose RTC was lost
+    /// during long dormancy stops logging biometrics; the documented fix is SET_CLOCK + REBOOT_STRAP
+    /// to re-arm it (docs/specs/2026-05-24-whoop-protocol-complete.md §0-bis). Non-destructive — a
+    /// reboot, NOT a wipe (that would be FORCE_TRIM, deliberately not included).
+    case rebootStrap           = 29
 
     // MARK: Alarm commands (confirmed for interoperability)
     /// Arm the strap's FIRMWARE alarm for a specific UTC time. The strap will buzz at that time
@@ -80,6 +85,7 @@ public enum WhoopCommand: UInt8, CaseIterable {
         case .runHapticsPattern:     return "Run Haptics Pattern"
         case .stopHaptics:           return "Stop Haptics"
         case .sendR10R11Realtime:    return "R10/R11 Realtime (raw stream)"
+        case .rebootStrap:           return "Reboot Strap (recovery)"
         case .setAlarmTime:          return "Set Alarm Time"
         case .getAlarmTime:          return "Get Alarm Time"
         case .runAlarm:              return "Run Alarm"

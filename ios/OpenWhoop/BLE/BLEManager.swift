@@ -95,6 +95,9 @@ public final class BLEManager: NSObject, ObservableObject {
     private var didBond = false
     private var clockRequested = false
     private var intentionalDisconnect = false
+    /// RECOVERY: fire the SET_CLOCK + REBOOT_STRAP latch at most once per app launch. Deliberately
+    /// NOT reset on disconnect, so the post-reboot reconnect does not reboot again (no boot loop).
+    private var didRebootForLatch = false
 
     /// Stable device id; matches the server's existing device for sync parity. Overridable.
     let deviceId: String
@@ -755,6 +758,26 @@ extension BLEManager: CBPeripheralDelegate {
         // Backfiller's per-chunk insert→ack. They run from exitBackfilling() once the offload drains.
         startUploadTimer()     // keep the server current during the live session
         startBackfillTimer()   // re-offload the type-47 store every backfillIntervalSeconds
+
+        // RECOVERY (stale-strap re-arm): a strap whose RTC was lost during long dormancy stops
+        // logging biometrics and its data-range stays frozen in the past. Documented fix: SET_CLOCK
+        // then REBOOT_STRAP to LATCH the clock (2026-05-24-whoop-protocol-complete.md §0-bis). Fire
+        // ONCE per launch, ~4s after connect (so GET_DATA_RANGE has populated strapNewestTs), and
+        // only when the strap looks stale (newest record before 2025, or unknown). Reboot is
+        // non-destructive; the link drops and we auto-reconnect with a freshly-latched clock.
+        if !didRebootForLatch {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                guard let self, !self.didRebootForLatch else { return }
+                let stale = (self.strapNewestTs ?? 0) < 1_735_689_600   // < 2025-01-01 (nil ⇒ stale)
+                guard stale else { return }
+                self.didRebootForLatch = true
+                self.log("Recovery: strap stale (newest=\(self.strapNewestTs.map(String.init) ?? "nil")) — SET_CLOCK + REBOOT_STRAP to latch")
+                self.send(.setClock, payload: BLEManager.setClockPayload())
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.send(.rebootStrap, payload: [0x00])
+                }
+            }
+        }
     }
 
     /// SET_CLOCK(10) payload = the strap's 8-byte form: [seconds u32 LE][subseconds
@@ -805,7 +828,8 @@ extension BLEManager: CBPeripheralDelegate {
                 // unblocks both the Collector (live path) and the Backfiller (chunk decoding).
                 if clockRef == nil {
                     let parsed = parseFrame(frame)
-                    if let ref = ClockCorrelation.clockRef(from: parsed, wall: Int(Date().timeIntervalSince1970)) {
+                    let wallNow = Int(Date().timeIntervalSince1970)
+                    if let ref = ClockCorrelation.clockRef(from: parsed, wall: wallNow) {
                         clockRef = ref
                         collector?.clockRef = ref                  // unblocks buffered persistence
                         backfiller?.clockRef = ref                 // unblocks historical chunk decode
@@ -817,6 +841,19 @@ extension BLEManager: CBPeripheralDelegate {
                             log("Clock drift detected — issuing SET_CLOCK")
                             send(.setClock, payload: BLEManager.setClockPayload())
                         }
+                    } else if parsed.ok, parsed.crcOK != false,
+                              parsed.typeName == "REALTIME_DATA",
+                              let deviceTs = parsed.parsed["timestamp"]?.intValue {
+                        // Firmware that answers GET_CLOCK with an EMPTY payload gives no "clock" field to
+                        // correlate, so live HR maps to ~1971. Correlate from the realtime stream's own
+                        // device-monotonic counter instead: pair its "timestamp" with wall-now. No drift
+                        // check (device is a monotonic counter, not the RTC; SET_CLOCK already ran in the
+                        // connect handshake).
+                        let ref = ClockRef(device: deviceTs, wall: wallNow)
+                        clockRef = ref
+                        collector?.clockRef = ref
+                        backfiller?.clockRef = ref
+                        log("Clock correlated from realtime stream (GET_CLOCK empty): device=\(ref.device) wall=\(ref.wall)")
                     }
                 }
                 if backfilling {

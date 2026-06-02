@@ -67,3 +67,6 @@ ios/build/
 
 # Mac-side device-soak captures (gitignored; not the committed hist_biometric.bin fixture)
 fixtures/soak_*.bin
+
+# Local server secrets — never commit
+server/.env
