@@ -39,6 +39,11 @@ public final class BLEManager: NSObject, ObservableObject {
 
     // MARK: Backfill
     private var backfiller: Backfiller?
+    /// On-disk store (same file MetricsRepository opens). Used to recompute sleep/daily after offload.
+    private var store: WhoopStore?
+    /// Called on the main actor after a historical offload + local metrics recompute so the UI
+    /// can reload Today/Sleep/Trends without a manual pull-to-refresh.
+    var onBackfillComplete: (() -> Void)?
     /// True while a historical offload session is in progress (frames route to Backfiller).
     private var backfilling = false
     /// Safety-net detector: strap reports newer data than us AND our frontier frozen 10 min ⇒ flag for
@@ -128,6 +133,7 @@ public final class BLEManager: NSObject, ObservableObject {
         guard collector == nil else { return }
         guard let path = try? StorePaths.defaultDatabasePath() else { return }
         guard let store = try? await WhoopStore(path: path) else { return }
+        self.store = store
         try? await store.upsertDevice(id: deviceId, mac: nil, name: "WHOOP 4.0")
         // Research toggle — OFF by default. When disabled the app is decoded-only and never
         // persists raw frames. Flip "enableRawCapture" in UserDefaults to capture raw again.
@@ -361,6 +367,20 @@ public final class BLEManager: NSObject, ObservableObject {
             UserDefaults.standard.set(state.lastSyncedAt, forKey: "lastSyncedAt")
         }
         checkStrapLiveness()         // safety-net: strap ahead of us AND our frontier frozen ⇒ stuck?
+        recomputeLocalMetricsAfterOffload()
+    }
+
+    /// After a type-47 historical offload, recompute sleep/daily from the newly inserted
+    /// streams so last night appears on Today/Sleep/Trends without a pull-to-refresh.
+    private func recomputeLocalMetricsAfterOffload() {
+        guard let store else { return }
+        let deviceId = self.deviceId
+        Task {
+            await LocalMetricsEngine(store: store, deviceId: deviceId).recompute(lastNDays: 3)
+            await MainActor.run { [weak self] in
+                self?.onBackfillComplete?()
+            }
+        }
     }
 
     /// After an offload, judge liveness: stuck = strap reports records newer than our frontier AND our
