@@ -1,5 +1,6 @@
 import XCTest
 import WhoopStore
+import WhoopProtocol
 @testable import OpenWhoop
 
 @MainActor
@@ -12,11 +13,19 @@ final class MetricsRepositoryTests: XCTestCase {
     }
 
     private func seedDaily(_ store: WhoopStore) async throws -> [DailyMetric] {
+        // Days must fall inside load()'s trailing 14-day UTC window.
+        let fmt = DateFormatter()
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        fmt.dateFormat = "yyyy-MM-dd"
+        let now = Date()
+        let d1 = fmt.string(from: now.addingTimeInterval(-2 * 86_400))
+        let d2 = fmt.string(from: now.addingTimeInterval(-1 * 86_400))
         let days = [
-            DailyMetric(day: "2026-05-20", totalSleepMin: 400, efficiency: 0.85,
+            DailyMetric(day: d1, totalSleepMin: 400, efficiency: 0.85,
                         deepMin: 80, remMin: 100, lightMin: 220, disturbances: 2,
                         restingHr: 55, avgHrv: 58, recovery: 0.62, strain: 10, exerciseCount: 1),
-            DailyMetric(day: "2026-05-21", totalSleepMin: 430, efficiency: 0.90,
+            DailyMetric(day: d2, totalSleepMin: 430, efficiency: 0.90,
                         deepMin: 90, remMin: 110, lightMin: 230, disturbances: 1,
                         restingHr: 52, avgHrv: 65, recovery: 0.75, strain: 12, exerciseCount: 0),
         ]
@@ -77,11 +86,11 @@ final class MetricsRepositoryTests: XCTestCase {
         let days = try await seedDaily(store)
 
         // Full window — should get both rows.
-        let all = await repo.daily(fromDay: "2026-05-01", toDay: "2026-05-31")
+        let all = await repo.daily(fromDay: "2000-01-01", toDay: "2099-12-31")
         XCTAssertEqual(all, days)
 
         // Narrow window — should get only the later row.
-        let narrow = await repo.daily(fromDay: "2026-05-21", toDay: "2026-05-31")
+        let narrow = await repo.daily(fromDay: days[1].day, toDay: "2099-12-31")
         XCTAssertEqual(narrow, [days[1]])
     }
 
@@ -90,7 +99,7 @@ final class MetricsRepositoryTests: XCTestCase {
         let repo = makeRepo(store: store)
         _ = try await seedDaily(store)
 
-        let result = await repo.daily(fromDay: "2026-01-01", toDay: "2026-01-31")
+        let result = await repo.daily(fromDay: "2010-01-01", toDay: "2010-01-31")
         XCTAssertTrue(result.isEmpty)
     }
 
@@ -242,5 +251,65 @@ final class MetricsRepositoryTests: XCTestCase {
         XCTAssertFalse(repo.isRefreshing, "isRefreshing must be false after refresh completes")
         XCTAssertNotNil(repo.today, "refresh must still populate today from cache")
         XCTAssertNotNil(repo.lastNight, "refresh must still populate lastNight from cache")
+    }
+
+    // MARK: - refresh() with serverSync nil fills cache from local streams
+
+    func testRefreshFillsCacheFromSyntheticStreamsWhenServerSyncNil() async throws {
+        let store = try await WhoopStore.inMemory()
+        try await store.upsertDevice(id: "test-device", mac: nil, name: "test")
+        let repo = makeRepo(store: store)
+
+        // Plant a still night whose end falls on today's UTC date, inside the 30 h window.
+        let cal = Calendar(identifier: .gregorian)
+        var utc = cal
+        utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        let todayStart = utc.startOfDay(for: Date())
+        let sleepStart = Int(todayStart.timeIntervalSince1970) + 2 * 3600  // 02:00 UTC
+        let minutes = 90
+        var hr: [HRSample] = []
+        var grav: [GravitySample] = []
+        var rr: [RRInterval] = []
+        for i in 0..<(minutes * 60) {
+            let ts = sleepStart + i
+            hr.append(HRSample(ts: ts, bpm: 54))
+            grav.append(GravitySample(ts: ts, x: 0, y: 0, z: 1))
+            rr.append(RRInterval(ts: ts, rrMs: 1050 + (i % 2 == 0 ? 12 : -12)))
+        }
+        _ = try await store.insert(Streams(hr: hr, rr: rr, gravity: grav), deviceId: "test-device")
+
+        XCTAssertNil(repo.today)
+        XCTAssertNil(repo.lastNight)
+
+        await repo.refresh()
+
+        XCTAssertFalse(repo.isRefreshing)
+        XCTAssertNotNil(repo.lastNight, "local recompute must write a sleepSession from still gravity")
+        XCTAssertNotNil(repo.today, "local recompute must write a dailyMetric for the night's end day")
+        XCTAssertGreaterThan(repo.lastNight?.endTs ?? 0, repo.lastNight?.startTs ?? 0)
+        XCTAssertGreaterThan(repo.today?.totalSleepMin ?? 0, 50)
+        XCTAssertNotNil(repo.today?.restingHr)
+        XCTAssertNotNil(repo.today?.avgHrv)
+        XCTAssertNil(repo.today?.recovery, "recovery stays nil until ≥4 local nights")
+        XCTAssertNil(repo.today?.deepMin)
+        XCTAssertNil(repo.today?.remMin)
+        let stages = repo.lastNight?.stagesJSON ?? ""
+        XCTAssertTrue(stages.contains("light"), "binary hypnogram should include light")
+    }
+
+    func testHRSeriesReadsLocalSamplesAndDownsamples() async throws {
+        let store = try await WhoopStore.inMemory()
+        let repo = makeRepo(store: store)
+        var hr: [HRSample] = []
+        for i in 0..<1000 {
+            hr.append(HRSample(ts: 1_700_000_000 + i, bpm: 60 + (i % 5)))
+        }
+        _ = try await store.insert(Streams(hr: hr), deviceId: "test-device")
+
+        let points = await repo.hrSeries(fromEpoch: 1_700_000_000, toEpoch: 1_700_001_000,
+                                         maxPoints: 50)
+        XCTAssertEqual(points.count, 50)
+        XCTAssertEqual(points.first?.value, 60)
+        XCTAssertEqual(Int(points.last?.value ?? 0), 60 + (999 % 5))
     }
 }

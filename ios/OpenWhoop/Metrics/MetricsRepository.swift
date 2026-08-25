@@ -1,13 +1,14 @@
 import Foundation
 import SwiftUI
 import WhoopStore
+import WhoopProtocol
 
 // MARK: - MetricsRepository
 //
 // View-facing read facade over the local MetricsCache (WhoopStore tables dailyMetric +
-// sleepSession). The phone does NO metric computation: all values are server-computed and
-// cached locally by ServerSync.pullDerived(). MetricsRepository only reads the cache and
-// delegates network refreshes to ServerSync.
+// sleepSession). LocalMetricsEngine fills those tables from on-device strap streams so
+// Today/Sleep/Trends work offline. When a server is configured, ServerSync.pullDerived()
+// still runs after the local recompute and overwrites the cache (server wins).
 //
 // LAZY-OPEN DESIGN: The synchronous init() does NOT open the on-disk store (WhoopStore.init
 // is async). Instead, ensureOpen() is called at the top of every async method and opens the
@@ -26,6 +27,7 @@ final class MetricsRepository: ObservableObject {
     // Injected directly (test path): store + sync are ready immediately; skip ensureOpen.
     private var store: WhoopStore?
     private var serverSync: ServerSync?
+    private var engine: LocalMetricsEngine?
     private let deviceId: String
 
     // Lazy-open state (app path).
@@ -41,6 +43,7 @@ final class MetricsRepository: ObservableObject {
         self.deviceId = deviceId
         self.store = nil
         self.serverSync = nil
+        self.engine = nil
         self._alreadyOpen = false
     }
 
@@ -51,6 +54,7 @@ final class MetricsRepository: ObservableObject {
     init(store: WhoopStore, serverSync: ServerSync?, deviceId: String) {
         self.store = store
         self.serverSync = serverSync
+        self.engine = LocalMetricsEngine(store: store, deviceId: deviceId)
         self.deviceId = deviceId
         self._alreadyOpen = true   // already wired — no lazy open needed
     }
@@ -77,6 +81,7 @@ final class MetricsRepository: ObservableObject {
                 return
             }
             store = openedStore
+            engine = LocalMetricsEngine(store: openedStore, deviceId: deviceId)
             serverSync = AppConfig.uploaderConfig(deviceId: deviceId)
                 .map { ServerSync(config: $0, store: openedStore, deviceId: deviceId) }
             _alreadyOpen = true
@@ -129,13 +134,13 @@ final class MetricsRepository: ObservableObject {
 
     // MARK: - Refresh from server then reload
 
-    /// Pull derived metrics from the server (if configured) then reload from cache.
-    /// Uses pullDerived() — NOT the heavy full-stream pull() — to keep the UI refresh fast.
-    /// Safe when serverSync == nil (just reloads). Never throws.
+    /// Recompute derived metrics from local streams, optionally overlay the server cache,
+    /// then reload. Safe when serverSync == nil (local engine only). Never throws.
     func refresh() async {
         await ensureOpen()
         isRefreshing = true
         lastError = nil
+        await engine?.recompute(lastNDays: 3)
         await serverSync?.pullDerived()
         await load()
         isRefreshing = false
@@ -234,21 +239,36 @@ final class MetricsRepository: ObservableObject {
 
     // MARK: - Raw HR series (downsampled stream, for Trends card + HeartRateDetailView)
 
-    /// Fetch a downsampled raw HR series from the server for a given epoch-second window.
+    /// Fetch a downsampled raw HR series from local `hrSample` for a given epoch-second window.
     /// Maps each (ts, bpm) pair to a TrendPoint so it can be fed directly to MetricChart.
-    /// Uses a single server-side max_points-capped request — NOT the incremental pager.
-    /// Returns [] on any network error or when unconfigured.
+    /// Returns [] when the store is unavailable or the window is empty.
     func hrSeries(fromEpoch: Int, toEpoch: Int, maxPoints: Int) async -> [TrendPoint] {
         await ensureOpen()
-        guard let serverSync else { return [] }
-        let raw = await serverSync.getHRSeries(fromEpoch: fromEpoch, toEpoch: toEpoch, maxPoints: maxPoints)
-        return raw.map { pair in
+        guard let store else { return [] }
+        let raw = (try? await store.hrSamples(deviceId: deviceId, from: fromEpoch, to: toEpoch,
+                                              limit: 2_000_000)) ?? []
+        return Self.downsample(raw, maxPoints: maxPoints).map { sample in
             TrendPoint(
-                id: "\(pair.ts)",
-                date: Date(timeIntervalSince1970: TimeInterval(pair.ts)),
-                value: Double(pair.bpm)
+                id: "\(sample.ts)",
+                date: Date(timeIntervalSince1970: TimeInterval(sample.ts)),
+                value: Double(sample.bpm)
             )
         }
+    }
+
+    /// Evenly stride `samples` down to at most `maxPoints`, always keeping first and last.
+    static func downsample(_ samples: [HRSample], maxPoints: Int) -> [HRSample] {
+        guard maxPoints > 0 else { return [] }
+        guard samples.count > maxPoints else { return samples }
+        if maxPoints == 1 { return [samples[samples.count / 2]] }
+        let last = maxPoints - 1
+        var out: [HRSample] = []
+        out.reserveCapacity(maxPoints)
+        for i in 0..<maxPoints {
+            let idx = (i * (samples.count - 1)) / last
+            out.append(samples[idx])
+        }
+        return out
     }
 
     // MARK: - Workouts (M5)

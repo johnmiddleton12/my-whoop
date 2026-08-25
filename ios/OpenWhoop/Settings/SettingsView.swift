@@ -56,7 +56,7 @@ enum ProfileUnits {
 
 // MARK: - Local persistence
 
-private enum ProfileStorage {
+enum ProfileStorage {
     static let key = "com.openwhoop.profile.v1"
 
     static func load() -> Profile? {

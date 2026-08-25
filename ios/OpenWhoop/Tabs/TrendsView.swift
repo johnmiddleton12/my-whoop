@@ -3,10 +3,10 @@ import WhoopStore
 
 // MARK: - TrendsView
 // M3 Trends tab — historical charts for Recovery / HRV / Resting HR / Strain / Sleep Duration,
-// plus a raw Heart Rate card (downsampled 1 Hz stream from /v1/streams/hr).
+// plus a raw Heart Rate card (downsampled 1 Hz stream from local hrSample).
 // Data source: MetricsRepository.daily(fromDay:toDay:) for daily-aggregate cards (cached locally
-// by ServerSync); MetricsRepository.hrSeries(fromEpoch:toEpoch:maxPoints:) for the HR card
-// (live single-request fetch, downsampled by the server).
+// by LocalMetricsEngine, optionally overlaid by ServerSync); MetricsRepository.hrSeries for the
+// HR card (local stream, stride-downsampled).
 // Tapping a daily chart card header → MetricDetailView (full history, range selector).
 // Tapping a chart point  → DayDetailView sheet (full day breakdown).
 // Tapping the HR card → HeartRateDetailView (range selector, stats strip).
@@ -74,7 +74,7 @@ struct TrendsView: View {
 
     // MARK: - Data loading
 
-    /// Reload raw HR for the card: last 24 hours, 300 points (server downsamples).
+    /// Reload raw HR for the card: last 24 hours, 300 points (local stride downsample).
     /// If no data is returned for 24h, automatically widens to 7 days so real data shows.
     private func reloadHR() async {
         hrIsLoading = true

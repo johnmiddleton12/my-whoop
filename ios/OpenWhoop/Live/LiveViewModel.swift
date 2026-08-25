@@ -30,6 +30,12 @@ public final class LiveViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    /// Wire a callback that fires after a historical offload has been written and local
+    /// sleep/daily metrics recomputed. AppRoot uses this to reload MetricsRepository.
+    func onHistoricalOffloadComplete(_ handler: @escaping () -> Void) {
+        ble.onBackfillComplete = handler
+    }
+
     public func connect()  { ble.connect() }
     public func disconnect() { ble.disconnect() }
     public func startRealtimeHR() { ble.send(.toggleRealtimeHR, payload: [0x01]) }

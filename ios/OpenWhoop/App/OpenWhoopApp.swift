@@ -27,5 +27,10 @@ private struct AppRoot: View {
         RootTabView()
             .environmentObject(metrics)
             .environmentObject(live)
+            .onAppear {
+                live.onHistoricalOffloadComplete {
+                    Task { await metrics.load() }
+                }
+            }
     }
 }
